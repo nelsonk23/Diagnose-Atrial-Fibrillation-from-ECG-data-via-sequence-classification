@@ -1,0 +1,337 @@
+import os
+import requests
+import zipfile
+import numpy as np
+import pandas as pd
+import scipy.io as sio
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import (accuracy_score, f1_score, roc_auc_score, confusion_matrix, classification_report)
+from sklearn.utils.class_weight import compute_class_weight
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.utils import to_categorical
+from tensorflow.keras.layers import (Dense, Conv1D, MaxPooling1D, Flatten, Dropout, LSTM)
+from imblearn.over_sampling import RandomOverSampler
+
+data_dir = 'training2017'
+reference_file = os.path.join(data_dir, 'REFERENCE.csv') 
+labels_df = pd.read_csv(reference_file, header=None, names=['Recording', 'Class'])
+ecg_data = [sio.loadmat(os.path.join(data_dir, f'{rec}.mat'))['val'][0] for rec in labels_df['Recording']]
+
+if len(ecg_data) == 8528:
+    print("Recording count is 8,528.")
+class_map = {'N': 'Normal', 'A': 'AF', 'O': 'Other', '~': 'Noisy'}
+class_counts = labels_df['Class'].map(class_map).value_counts()
+print("\nClass Distribution Table:")
+print(class_counts)
+plt.figure(figsize=(10, 6))
+sns.countplot(x=labels_df['Class'].map(class_map), order=class_counts.index)
+plt.title('Distribution of ECG Classes')
+plt.xlabel('Rhythm Class')
+plt.ylabel('Number of Recordings')
+plt.show()
+
+recording_lengths = [len(sig) for sig in ecg_data]
+plt.figure(figsize=(12, 6))
+sns.histplot(recording_lengths, bins=50, kde=True)
+plt.title('Distribution of ECG Recording Lengths')
+plt.xlabel('Length')
+plt.ylabel('Frequency')
+plt.show()
+
+max_len = max(recording_lengths)
+X = np.zeros((len(ecg_data), max_len))
+for i, signal in enumerate(ecg_data):
+    X[i, :len(signal)] = signal
+label_encoder = LabelEncoder()
+y_encoded = label_encoder.fit_transform(labels_df['Class'])
+y = to_categorical(y_encoded)
+X_train, X_temp, y_train, y_temp = train_test_split(X, y, test_size=0.30, random_state=42, stratify=y)
+X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.50, random_state=42, stratify=y_temp)
+X_train_r = np.expand_dims(X_train, axis=-1)
+X_val_r = np.expand_dims(X_val, axis=-1)
+X_test_r = np.expand_dims(X_test, axis=-1)
+print(f"X_train: {X_train_r.shape} | y_train: {y_train.shape}")
+print(f"X_val:   {X_val_r.shape} | y_val:   {y_val.shape}")
+print(f"X_test:  {X_test_r.shape} | y_test:  {y_test.shape}")
+
+def evaluate_model(model, X_test_data, y_test_data, model_name, label_encoder):
+    y_pred_prob = model.predict(X_test_data)
+    y_pred = np.argmax(y_pred_prob, axis=1)
+    y_true = np.argmax(y_test_data, axis=1)
+    overall_accuracy = accuracy_score(y_true, y_pred)
+    print(f"Overall Test Accuracy: {overall_accuracy:.4f}")
+    auc = roc_auc_score(y_test_data, y_pred_prob, multi_class='ovr')
+    print(f"AUC Score: {auc:.4f}")
+    cm = confusion_matrix(y_true, y_pred)
+    per_class_accuracy = cm.diagonal() / cm.sum(axis=1)
+    print("\nPer-Class Accuracy (Recall):")
+    for i, class_name in enumerate(label_encoder.classes_):
+        print(f"  - Class {class_name}: {per_class_accuracy[i]:.4f}")
+    print(classification_report(y_true, y_pred, target_names=label_encoder.classes_))
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',xticklabels=label_encoder.classes_, yticklabels=label_encoder.classes_)
+    plt.title(f'Confusion Matrix for {model_name}')
+    plt.xlabel('Predicted Label')
+    plt.ylabel('True Label')
+    plt.show()
+
+INPUT_SHAPE = X_train_r.shape[1:]
+NUM_CLASSES = y.shape[1]
+dnn_model = Sequential([
+    Flatten(input_shape=INPUT_SHAPE),
+    Dense(128, activation='relu'), 
+    Dropout(0.5),
+    Dense(NUM_CLASSES, activation='softmax')
+])
+dnn_model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+dnn_model.summary()
+dnn_history = dnn_model.fit(X_train_r, y_train, validation_data=(X_val_r, y_val), epochs=10, batch_size=64, verbose=1)
+
+evaluate_model(dnn_model, X_test_r, y_test, "Dense NN", label_encoder)
+
+dnn_model = Sequential([
+    Flatten(input_shape=INPUT_SHAPE),
+    Dense(128, activation='relu'),
+    Dropout(0.5),
+    Dense(64, activation='relu'),
+    Dropout(0.5),
+    Dense(NUM_CLASSES, activation='softmax')
+])
+dnn_model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+dnn_model.summary()
+dnn_history = dnn_model.fit(X_train_r, y_train, validation_data=(X_val_r, y_val), epochs=10, batch_size=64, verbose=1)
+
+evaluate_model(dnn_model, X_test_r, y_test, "Optimized Dense NN 1", label_encoder)
+
+y_integers = np.argmax(y_train, axis=1)
+class_weights = compute_class_weight(
+    class_weight='balanced',
+    classes=np.unique(y_integers),
+    y=y_integers
+)
+class_weights_dict = dict(enumerate(class_weights))
+print(f"Calculated Class Weights: {class_weights_dict}")
+dnn_model = Sequential([
+    Flatten(input_shape=INPUT_SHAPE),
+    Dense(128, activation='relu'),
+    Dropout(0.5),
+    Dense(NUM_CLASSES, activation='softmax')
+])
+dnn_model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+dnn_model.summary()
+dnn_history = dnn_model.fit(
+    X_train_r,
+    y_train,
+    validation_data=(X_val_r, y_val),
+    epochs=15,  
+    batch_size=64,
+    class_weight=class_weights_dict, 
+    verbose=1
+)
+
+evaluate_model(dnn_model, X_test_r, y_test, "Optimized Dense NN 2", label_encoder)
+
+dnn_model = Sequential([
+    Flatten(input_shape=INPUT_SHAPE),
+    Dense(128, activation='relu'),
+    Dropout(0.5),
+    Dense(NUM_CLASSES, activation='softmax')
+])
+optimizer = Adam(learning_rate=0.0001)
+dnn_model.compile(optimizer=optimizer, loss='categorical_crossentropy', metrics=['accuracy'])
+dnn_model.summary()
+dnn_history = dnn_model.fit(
+    X_train_r,
+    y_train,
+    validation_data=(X_val_r, y_val),
+    epochs=30,  
+    batch_size=64,
+    class_weight=class_weights_dict, 
+    verbose=1
+)
+
+evaluate_model(dnn_model, X_test_r, y_test, "Optimized Dense NN 2", label_encoder)
+
+cnn_model = Sequential([
+    Conv1D(filters=64, kernel_size=10, activation='relu', input_shape=INPUT_SHAPE),
+    MaxPooling1D(pool_size=3),
+    Dropout(0.5),
+    Conv1D(filters=128, kernel_size=10, activation='relu'),
+    MaxPooling1D(pool_size=3),
+    Dropout(0.5),
+    Flatten(),
+    Dense(128, activation='relu'),
+    Dense(NUM_CLASSES, activation='softmax')
+])
+cnn_model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+cnn_model.summary()
+cnn_history = cnn_model.fit(X_train_r, y_train, validation_data=(X_val_r, y_val), epochs=10, batch_size=64, verbose=1)
+
+evaluate_model(cnn_model, X_test_r, y_test, "Convolutional NN", label_encoder)
+
+cnn_model = Sequential([
+    Conv1D(filters=64, kernel_size=10, activation='relu', input_shape=INPUT_SHAPE),
+    MaxPooling1D(pool_size=3),
+    Dropout(0.5),
+    Conv1D(filters=128, kernel_size=10, activation='relu'),
+    MaxPooling1D(pool_size=3),
+    Dropout(0.5),
+    Flatten(),
+    Dense(128, activation='relu'),
+    Dense(NUM_CLASSES, activation='softmax')
+])
+cnn_model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+cnn_model.summary()
+cnn_history = cnn_model.fit(
+    X_train_r,
+    y_train,
+    validation_data=(X_val_r, y_val),
+    epochs=15,
+    batch_size=64,
+    class_weight=class_weights_dict, 
+    verbose=1
+)
+
+evaluate_model(cnn_model, X_test_r, y_test, "Optimized Convolutional NN 1", label_encoder)
+
+cnn_model = Sequential([
+    Conv1D(filters=64, kernel_size=10, activation='relu', padding='same', input_shape=INPUT_SHAPE),
+    MaxPooling1D(pool_size=3),
+    Conv1D(filters=128, kernel_size=10, activation='relu', padding='same'),
+    MaxPooling1D(pool_size=3),
+    Conv1D(filters=256, kernel_size=10, activation='relu', padding='same'),
+    MaxPooling1D(pool_size=3),
+    Flatten(),
+    Dense(128, activation='relu'),
+    Dropout(0.5),
+    Dense(NUM_CLASSES, activation='softmax')
+])
+cnn_model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+cnn_model.summary()
+cnn_history = cnn_model.fit(
+    X_train_r,
+    y_train,
+    validation_data=(X_val_r, y_val),
+    epochs=20, 
+    batch_size=64,
+    class_weight=class_weights_dict,
+    verbose=1
+)
+
+evaluate_model(cnn_model, X_test_r, y_test, "Optimized Convolutional NN 2", label_encoder)
+
+cnn_model = Sequential([
+    Conv1D(filters=64, kernel_size=10, activation='relu', padding='same', input_shape=INPUT_SHAPE),
+    MaxPooling1D(pool_size=3),
+    Conv1D(filters=128, kernel_size=10, activation='relu', padding='same'),
+    MaxPooling1D(pool_size=3),
+    Conv1D(filters=256, kernel_size=10, activation='relu', padding='same'),
+    MaxPooling1D(pool_size=3),
+    Flatten(),
+    Dense(128, activation='relu'),
+    Dropout(0.5),
+    Dense(NUM_CLASSES, activation='softmax')
+])
+optimizer = Adam(learning_rate=0.0001)
+cnn_model.compile(optimizer=optimizer, loss='categorical_crossentropy', metrics=['accuracy'])
+cnn_model.summary()
+cnn_history = cnn_model.fit(
+    X_train_r,
+    y_train,
+    validation_data=(X_val_r, y_val),
+    epochs=20, 
+    batch_size=64,
+    class_weight=class_weights_dict,
+    verbose=1
+)
+
+evaluate_model(cnn_model, X_test_r, y_test, "Optimized Convolutional NN 3", label_encoder)
+
+lstm_model = Sequential([
+    LSTM(64, input_shape=INPUT_SHAPE),
+    Dropout(0.5),
+    Dense(64, activation='relu'),
+    Dense(NUM_CLASSES, activation='softmax')
+])
+lstm_model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+lstm_model.summary()
+lstm_history = lstm_model.fit(X_train_r, y_train, validation_data=(X_val_r, y_val), epochs=10, batch_size=64, verbose=1)
+
+evaluate_model(lstm_model, X_test_r, y_test, "LSTM Network", label_encoder)
+
+lstm_model = Sequential([
+    LSTM(64, input_shape=INPUT_SHAPE),
+    Dropout(0.5),
+    Dense(64, activation='relu'),
+    Dense(NUM_CLASSES, activation='softmax')
+])
+lstm_model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+lstm_model.summary()
+lstm_history = lstm_model.fit(
+    X_train_r,
+    y_train,
+    validation_data=(X_val_r, y_val),
+    epochs=20, 
+    batch_size=64,
+    class_weight=class_weights_dict, 
+    verbose=1
+)
+
+evaluate_model(lstm_model, X_test_r, y_test, "Optimized LSTM Network 1", label_encoder)
+
+lstm_model = Sequential([
+    LSTM(64, input_shape=INPUT_SHAPE),
+    Dropout(0.5),
+    Dense(64, activation='relu'),
+    Dense(NUM_CLASSES, activation='softmax')
+])
+optimizer = Adam(learning_rate=0.0001)
+lstm_model.compile(optimizer=optimizer, loss='categorical_crossentropy', metrics=['accuracy'])
+lstm_model.summary()
+lstm_history = lstm_model.fit(
+    X_train_r,
+    y_train,
+    validation_data=(X_val_r, y_val),
+    epochs=20, 
+    batch_size=64,
+    class_weight=class_weights_dict, 
+    verbose=1
+)
+
+evaluate_model(lstm_model, X_test_r, y_test, "Optimized LSTM Network 2", label_encoder)
+
+X_train_flat = X_train.reshape(X_train.shape[0], -1)
+y_train_integers = np.argmax(y_train, axis=1)
+ros = RandomOverSampler(random_state=42)
+X_train_resampled_flat, y_train_resampled = ros.fit_resample(X_train_flat, y_train_integers)
+X_train_resampled = X_train_resampled_flat.reshape(X_train_resampled_flat.shape[0], X_train.shape[1], 1)
+y_train_resampled = to_categorical(y_train_resampled, num_classes=NUM_CLASSES)
+optimizer = Adam(learning_rate=0.0001)
+lstm_model = Sequential([
+    Conv1D(filters=64, kernel_size=10, activation='relu', padding='same', input_shape=INPUT_SHAPE),
+    MaxPooling1D(pool_size=3),
+    Conv1D(filters=128, kernel_size=10, activation='relu', padding='same'),
+    MaxPooling1D(pool_size=3),
+    LSTM(64),
+    Dropout(0.5),
+    Dense(64, activation='relu'),
+    Dense(NUM_CLASSES, activation='softmax')
+])
+lstm_model.compile(optimizer=optimizer, loss='categorical_crossentropy', metrics=['accuracy'])
+lstm_model.summary()
+lstm_history = lstm_model.fit(
+    X_train_resampled, 
+    y_train_resampled, 
+    validation_data=(X_val_r, y_val),
+    epochs=25,
+    batch_size=64,
+    verbose=1
+)
+
+evaluate_model(lstm_model, X_test_r, y_test, "Optimized LSTM Network 3", label_encoder)
+
